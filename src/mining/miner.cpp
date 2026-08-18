@@ -24,6 +24,14 @@
 #include "sha256_s3.h"  // S3-specific SHA (proven working with self-test)
 #include "sha256_s3_dma.h"  // DMA-based SHA test
 #include "sha256_asm.h"  // Pipelined assembly mining (Core 1) - ESP32
+#include "build_tune.h"   // autoresearch experiment overrides
+#if defined(CONFIG_IDF_TARGET_ESP32) && (defined(PIPE_V5) || defined(PIPE_V6) || defined(PIPE_V9))
+#include "sha256_pipelined_v5.h"
+#endif
+#ifdef USE_NERD_SW
+#include "nerdSHA256plus.h"
+#include <mbedtls/sha256.h>
+#endif
 #include "sha256_pipelined_s3.h"  // Pipelined assembly mining (Core 1) - ESP32-S3
 #include "miner_sha256.h"  // BitsyMiner software SHA-256 (verification + Core 0)
 #include "../stratum/stratum.h"
@@ -531,6 +539,50 @@ void miner_task_core0(void *param) {
         // Always compute SOFTWARE midstate (for fallback and verification)
         miner_sha256_midstate(&sw_midstate, &hb);
 
+#ifdef USE_NERD_SW
+        // NerdMiner nerdSHA256plus port (GPL v3, Bitmaker/Jade lineage):
+        // fully-unrolled midstate+bake SW double-SHA with 16-bit early exit.
+        // Used as a fast pre-filter; every hit is re-verified with the
+        // BitsyMiner path below, so the submitted hash/format is unchanged.
+        uint32_t nerd_mid[8];
+        uint32_t nerd_bake[16];
+        uint8_t nerd_buf[128];
+        uint8_t nerd_out[32];
+        memcpy(nerd_buf, &hb, 80);
+        memset(nerd_buf + 80, 0, 48);
+        nerd_buf[80] = 0x80;
+        nerd_buf[126] = 0x02;   // 640 bits, big-endian length word
+        nerd_buf[127] = 0x80;
+        nerd_mids(nerd_mid, nerd_buf);
+        nerd_sha256_bake(nerd_mid, nerd_buf + 64, nerd_bake);
+#ifdef SW_CROSSCHECK
+        {
+            // Deterministic sanity check: nerd midstate must equal the SHA-256
+            // state of the first 64 header bytes (computed via mbedtls).
+            mbedtls_sha256_context ms;
+            mbedtls_sha256_init(&ms);
+            mbedtls_sha256_starts_ret(&ms, 0);
+            mbedtls_sha256_update_ret(&ms, nerd_buf, 64);
+            int direct = 1, swapped = 1, rev = 1, revsw = 1;
+            for (int i = 0; i < 8; i++) {
+                uint32_t ref = ms.state[i];
+                uint32_t rref = ms.state[7 - i];
+                if (nerd_mid[i] != ref) direct = 0;
+                if (nerd_mid[i] != __builtin_bswap32(ref)) swapped = 0;
+                if (nerd_mid[i] != rref) rev = 0;
+                if (nerd_mid[i] != __builtin_bswap32(rref)) revsw = 0;
+            }
+            mbedtls_sha256_free(&ms);
+            const char *how = direct ? "direct" : swapped ? "swapped" : rev ? "reversed" : revsw ? "rev+swapped" : NULL;
+            if (how) {
+                Serial.printf("[NERD] midstate cross-check PASS (%s)\n", how);
+            } else {
+                Serial.println("[NERD] midstate cross-check FAIL - check nerd port!");
+            }
+        }
+#endif
+#endif
+
         // Prepare byte-swapped header for hardware SHA
         uint32_t header_swapped[20];
         uint32_t *header_words = (uint32_t *)&hb;
@@ -550,9 +602,23 @@ void miner_task_core0(void *param) {
 
         while (s_miningActive) {
             // Pure software SHA - no hardware contention with Core 1
+#ifdef USE_NERD_SW
+            ((volatile uint32_t *)(nerd_buf + 76))[0] = hb.nonce;
+            if (nerd_sha256d_baked(nerd_mid, nerd_buf + 64, nerd_bake, nerd_out)) {
+                // Authoritative hash + submit format stays with the proven path
+                if (miner_sha256_header(&sw_midstate, &ctx, &hb)) {
+                    hashCheck(jobId, &ctx, hb.timestamp, hb.nonce);
+                } else {
+                    static uint32_t s_nerdFalsePos = 0;
+                    if (++s_nerdFalsePos <= 3)
+                        Serial.println("[NERD] pre-filter hit not confirmed (benign)");
+                }
+            }
+#else
             if (miner_sha256_header(&sw_midstate, &ctx, &hb)) {
                 hashCheck(jobId, &ctx, hb.timestamp, hb.nonce);
             }
+#endif
             hb.nonce++;
             s_stats.hashes++;
             s_core0Hashes++;  // DEBUG: Track Core 0 contribution
@@ -680,10 +746,21 @@ void miner_task_core1(void *param) {
             // Track hash count before v3 call for per-core stats
             uint64_t hashBefore = s_stats.hashes;
 
+#if defined(PIPE_V9) && defined(CONFIG_IDF_TARGET_ESP32)
+            // v9: NMMiner-shaped pipeline (tail-issued midstate START, split blk1 restore)
+            bool candidate = sha256_pipelined_mine_v9(
+#elif defined(PIPE_V6) && defined(CONFIG_IDF_TARGET_ESP32)
+            // v6: v3 minus the memw barriers (RESEARCH.md: NMMiner has zero memw)
+            bool candidate = sha256_pipelined_mine_v6(
+#elif defined(PIPE_V5) && defined(CONFIG_IDF_TARGET_ESP32)
+            // Run NOP-timed pipelined assembly mining loop v5 (auto-calibrated)
+            bool candidate = sha256_pipelined_mine_v5(
+#else
             // Run pipelined assembly mining loop v3 (working version)
             // NOTE: v4 midstate injection does NOT work on ESP32 - SHA_LOAD copies
             // FROM internal state TO SHA_TEXT, there's no way to restore a midstate
             bool candidate = sha256_pipelined_mine_v3(
+#endif
                 sha_base,
                 header_swapped,
                 &nonce_swapped,
@@ -697,8 +774,13 @@ void miner_task_core1(void *param) {
             if (!s_miningActive) break;
 
             if (candidate) {
-                // BitsyMiner pattern: The assembly incremented nonce BEFORE exiting, so use nonce-1
+                // v9 increments the nonce BEFORE hashing it (NMMiner pattern): the value
+                // in nonce_swapped IS the candidate. v3 pre-incremented => use nonce-1.
+#if defined(PIPE_V9) && defined(CONFIG_IDF_TARGET_ESP32)
+                uint32_t candidate_nonce_swapped = nonce_swapped;
+#else
                 uint32_t candidate_nonce_swapped = nonce_swapped - 1;
+#endif
                 uint32_t candidate_nonce_native = __builtin_bswap32(candidate_nonce_swapped);
 
                 // BitsyMiner CRITICAL pattern: Verify with SOFTWARE SHA on UNSWAPPED header

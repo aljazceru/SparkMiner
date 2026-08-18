@@ -14,9 +14,15 @@
 #include "../stratum/stratum.h"
 #include "../config/nvs_config.h"
 #include "../config/wifi_manager.h"
+#include "build_tune.h"
+#if defined(CONFIG_IDF_TARGET_ESP32) && (defined(PIPE_V5) || defined(PIPE_V9))
+#include "../mining/sha256_pipelined_v5.h"
+#endif
 
 // Update intervals
-#define DISPLAY_UPDATE_MS   1000    // 1 second
+#ifndef DISPLAY_UPDATE_MS
+#define DISPLAY_UPDATE_MS   1000    // 1 second (autoresearch: overridable)
+#endif
 #define STATS_UPDATE_MS     10000   // 10 seconds
 #define PERSIST_STATS_MS    3600000 // 1 hour - save to flash for persistence
 #define EARLY_SAVE_MS       300000  // 5 minutes - initial save interval before first hourly
@@ -219,6 +225,11 @@ void monitor_task(void *param) {
 
     while (true) {
         uint32_t now = millis();
+
+#if defined(CONFIG_IDF_TARGET_ESP32) && (defined(PIPE_V5) || defined(PIPE_V9))
+        // Autoresearch serial tuner (TUNE/CAL/AUTOCAL) - non-blocking
+        v5_handle_serial();
+#endif
 
         // Update live stats periodically
         if (now - s_lastStatsUpdate >= STATS_UPDATE_MS) {

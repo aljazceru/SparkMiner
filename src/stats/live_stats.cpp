@@ -14,6 +14,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <base64.h>
+#include "../build_tune.h"
 #include "live_stats.h"
 #include "board_config.h"
 #include "../config/nvs_config.h"
@@ -930,6 +931,7 @@ void live_stats_init() {
     }
 
     // Start background task
+#ifndef FORCE_STATS_OFF
     xTaskCreatePinnedToCore(
         live_stats_task,
         "StatsTask",
@@ -939,6 +941,9 @@ void live_stats_init() {
         NULL,
         STATS_CORE
     );
+#else
+    Serial.println("[STATS] Task disabled at build (FORCE_STATS_OFF)");
+#endif
 }
 
 const live_stats_t *live_stats_get() {
