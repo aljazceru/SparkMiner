@@ -10,8 +10,11 @@
  *   PIPE_V6 1            - v3 with memw barriers removed (experimental)
  *   PIPE_V9 1            - NMMiner-shaped pipeline (winner, see BENCH.md)
  *   USE_NERD_SW 1        - NerdMiner nerdSHA256plus SW miner on core 0
- *   SW_CROSSCHECK 1      - boot-time midstate cross-check for the nerd port
+ *                          (net negative on classic ESP32 - see BENCH.md r2)
+ *   SW_CROSSCHECK 1      - boot-time double-hash equivalence check (nerd port)
+ *   QUIET_MINER 1        - silence core-1 hot-path UART prints
  *   FORCE_STATS_OFF 1    - do not start the live-stats HTTP task
  *   DISPLAY_UPDATE_MS N  - TFT refresh period (default 1000)
+ *   BUTTON_POLL_MS N     - button task poll period (default 10)
  *   CORE_0_YIELD_COUNT N - SW miner yields every N hashes (default 512)
  */

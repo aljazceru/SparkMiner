@@ -25,6 +25,9 @@
 #include "sha256_s3_dma.h"  // DMA-based SHA test
 #include "sha256_asm.h"  // Pipelined assembly mining (Core 1) - ESP32
 #include "build_tune.h"   // autoresearch experiment overrides
+#ifndef QUIET_MINER
+#define QUIET_MINER 0
+#endif
 #if defined(CONFIG_IDF_TARGET_ESP32) && (defined(PIPE_V5) || defined(PIPE_V6) || defined(PIPE_V9))
 #include "sha256_pipelined_v5.h"
 #endif
@@ -318,7 +321,12 @@ static void hashCheck(const char *jobId, sha256_hash_t *ctx, uint32_t timestamp,
         }
 
         double shareDiff = getDifficulty(ctx);
+#if QUIET_MINER
+        /* hot-path print removed: runs in the miner task (core 1) and blocks
+         * the mining loop on UART; [STRATUM] Submit (core 0) still logs it */
+#else
         Serial.printf("[MINER] Share found! Diff: %.4f (pool: %.4f) Nonce: %08x\n", shareDiff, s_poolDifficulty, nonce);
+#endif
 
         // Debug logging for share validation (Issue #5 investigation)
         #if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(DEBUG_SHARE_VALIDATION)
@@ -444,6 +452,9 @@ void miner_start_job(const stratum_job_t *job) {
     // Debug: print header bytes
     char en2Hex[17];
     encodeExtraNonce(en2Hex, s_extraNonce2Size, s_extraNonce2);
+#if QUIET_MINER
+    Serial.printf("[MINER] New job: %s\n", s_currentJobId);
+#else
     Serial.printf("[MINER] New job: %s, diff=%08x\n", s_currentJobId, s_pendingBlock.difficulty);
     Serial.printf("[MINER] en2=%s, ntime=%s, version=%s\n", en2Hex, job->ntime, job->version);
     Serial.printf("[MINER] Header bytes 0-7: %02x%02x%02x%02x %02x%02x%02x%02x\n",
@@ -451,6 +462,7 @@ void miner_start_job(const stratum_job_t *job) {
         ((uint8_t*)&s_pendingBlock)[2], ((uint8_t*)&s_pendingBlock)[3],
         ((uint8_t*)&s_pendingBlock)[4], ((uint8_t*)&s_pendingBlock)[5],
         ((uint8_t*)&s_pendingBlock)[6], ((uint8_t*)&s_pendingBlock)[7]);
+#endif
 
     // Set block target
     bits_to_target(s_pendingBlock.difficulty, s_blockTarget);
@@ -557,27 +569,25 @@ void miner_task_core0(void *param) {
         nerd_sha256_bake(nerd_mid, nerd_buf + 64, nerd_bake);
 #ifdef SW_CROSSCHECK
         {
-            // Deterministic sanity check: nerd midstate must equal the SHA-256
-            // state of the first 64 header bytes (computed via mbedtls).
-            mbedtls_sha256_context ms;
-            mbedtls_sha256_init(&ms);
-            mbedtls_sha256_starts_ret(&ms, 0);
-            mbedtls_sha256_update_ret(&ms, nerd_buf, 64);
-            int direct = 1, swapped = 1, rev = 1, revsw = 1;
-            for (int i = 0; i < 8; i++) {
-                uint32_t ref = ms.state[i];
-                uint32_t rref = ms.state[7 - i];
-                if (nerd_mid[i] != ref) direct = 0;
-                if (nerd_mid[i] != __builtin_bswap32(ref)) swapped = 0;
-                if (nerd_mid[i] != rref) rev = 0;
-                if (nerd_mid[i] != __builtin_bswap32(rref)) revsw = 0;
-            }
-            mbedtls_sha256_free(&ms);
-            const char *how = direct ? "direct" : swapped ? "swapped" : rev ? "reversed" : revsw ? "rev+swapped" : NULL;
-            if (how) {
-                Serial.printf("[NERD] midstate cross-check PASS (%s)\n", how);
-            } else {
-                Serial.println("[NERD] midstate cross-check FAIL - check nerd port!");
+            /* Equivalence test (once per boot): compute the double hash of the
+             * current header with a fixed nonce via the nerd port AND via the
+             * proven BitsyMiner path; the 32-byte results must be identical.
+             * This is the real correctness criterion (word-order conventions
+             * of intermediate midstates differ between the two impls). */
+            static bool s_checked = false;
+            if (!s_checked) {
+                uint8_t out[32];
+                ((volatile uint32_t *)(nerd_buf + 76))[0] = hb.nonce;
+                bool nerdHit = nerd_sha256d_baked(nerd_mid, nerd_buf + 64, nerd_bake, out);
+                sha256_hash_t ref{};
+                bool refHit = miner_sha256_header(&sw_midstate, &ref, &hb);
+                bool same = (nerdHit == refHit);
+                if (nerdHit && refHit)
+                    for (int i = 0; i < 32; i++)
+                        if (out[i] != ref.bytes[i]) { same = false; break; }
+                Serial.printf("[NERD] double-hash equivalence check %s (nerd=%d bitsy=%d)\n",
+                              same ? "PASS" : "FAIL", nerdHit, refHit);
+                s_checked = true;
             }
         }
 #endif

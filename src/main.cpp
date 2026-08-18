@@ -31,6 +31,7 @@ extern "C" {
 #include "stratum/stratum_types.h"
 #include "stratum/stratum.h"
 #include "config/nvs_config.h"
+#include "build_tune.h"
 #include "config/wifi_manager.h"
 #include "stats/monitor.h"
 #include "display/display.h"
@@ -148,7 +149,10 @@ void button_task(void *param) {
     Serial.println("[BUTTON] Task started on core 0");
     for (;;) {
         button.tick();
-        vTaskDelay(pdMS_TO_TICKS(10));  // 10ms polling = responsive buttons
+#ifndef BUTTON_POLL_MS
+#define BUTTON_POLL_MS 10       // stock 10ms; autoresearch: 40ms saves core-0 wakeups
+#endif
+        vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
     }
 }
 

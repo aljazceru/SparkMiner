@@ -683,108 +683,127 @@ bool IRAM_ATTR sha256_pipelined_mine_v9(
                       d0[0], d0[1], d0[2], d0[3], d0[4]);
     }
 
-    /* per-job staging buffers (swapped words):
-     * blk1[16] = header words 0..15
-     * blk2[16] = [merkle_w7, time, nbits, nonce][0x80000000][0 x10][0x280]  */
-    static uint32_t blk1[16], blk2[16];
+    /* Staging (swapped words). blk2[17]: words 0..15 are the hash1 block-2
+     * image copied to TEXT each nonce; word 16 is a scratch slot used to
+     * export the burst counter out of the asm (see v9_end). */
+    static uint32_t blk1[16], blk2[17];
     for (int i = 0; i < 16; i++) blk1[i] = header_swapped[i];
     for (int i = 0; i < 4; i++)  blk2[i] = header_swapped[16 + i];
     blk2[4] = 0x80000000u;
     for (int i = 5; i < 15; i++) blk2[i] = 0;
     blk2[15] = 0x280u;
+    blk2[16] = 0;
     blk2[3] = *nonce_ptr;          /* continue the nonce sweep (swapped repr) */
 
-    asm volatile(
-        "mov.n   a2,  %[sb]          \n"   /* a2 = TEXT base                  */
-        "addi    a5,  %[sb], 0x90    \n"   /* a5 = control base               */
+    /* Register plan (persistent, all clobbered):
+     *   a2  TEXT base          a3  blk2 ptr
+     *   a4  delays ptr (nd)    a5  control base (TEXT+0x90)
+     *   a6,a7,a8,a12,a13,a14   blk1 words 0..5 (constant per job)
+     *   a9  burst counter      a11 blk1 ptr (tail words 6,7)
+     *   a15 mining-flag ptr
+     * a10 = ctx operand (read-modified input, used as scratch after field
+     * loads). The 64-bit hash counter is NOT touched per nonce anymore:
+     * a9 accumulates the burst and is exported via blk2[16]; the C epilogue
+     * performs the single 64-bit add. */
+    struct { const volatile uint32_t *sb; const uint32_t *b1, *b2;
+             const volatile uint16_t *nd; const volatile bool *flag; } ctx =
+           { sha_base, blk1, blk2, g_v5_delays, mining_flag };
+    uint32_t ctx_sink = (uint32_t)&ctx;
 
-        /* ---- init: full block 1 into TEXT, start midstate hash ---- */
-        "l32i.n  a10, %[b1], 0       \n"
-        "s32i.n  a10, a2,  0         \n"
-        "l32i.n  a10, %[b1], 4       \n"
-        "s32i.n  a10, a2,  4         \n"
-        "l32i.n  a10, %[b1], 8       \n"
-        "s32i.n  a10, a2,  8         \n"
-        "l32i.n  a10, %[b1], 12      \n"
+    asm volatile(
+        "mov.n   a10, %[cx]          \n"
+        "l32i.n  a2,  a10,  0        \n"   /* sb                     */
+        "addi    a5,  a2,  0x90      \n"   /* control base           */
+        "l32i.n  a11, a10,  4        \n"   /* b1                     */
+        "l32i.n  a3,  a10,  8        \n"   /* b2                     */
+        "l32i.n  a4,  a10, 12        \n"   /* nd                     */
+        "l32i.n  a15, a10, 16        \n"   /* flag                   */
+        "l32i.n  a6,  a11,  0        \n"   /* cache blk1 w0..w5      */
+        "l32i.n  a7,  a11,  4        \n"
+        "l32i.n  a8,  a11,  8        \n"
+        "l32i.n  a12, a11, 12        \n"
+        "l32i.n  a13, a11, 16        \n"
+        "l32i.n  a14, a11, 20        \n"
+        "movi.n  a9,  0              \n"   /* burst counter          */
+
+        /* init: full block 1 into TEXT, start first midstate hash */
+        "l32i.n  a10, a11,  0        \n"
+        "s32i.n  a10, a2,   0        \n"
+        "l32i.n  a10, a11,  4        \n"
+        "s32i.n  a10, a2,   4        \n"
+        "l32i.n  a10, a11,  8        \n"
+        "s32i.n  a10, a2,   8        \n"
+        "l32i.n  a10, a11, 12        \n"
         "s32i.n  a10, a2,  12        \n"
-        "l32i.n  a10, %[b1], 16      \n"
+        "l32i.n  a10, a11, 16        \n"
         "s32i.n  a10, a2,  16        \n"
-        "l32i.n  a10, %[b1], 20      \n"
+        "l32i.n  a10, a11, 20        \n"
         "s32i.n  a10, a2,  20        \n"
-        "l32i.n  a10, %[b1], 24      \n"
+        "l32i.n  a10, a11, 24        \n"
         "s32i.n  a10, a2,  24        \n"
-        "l32i.n  a10, %[b1], 28      \n"
+        "l32i.n  a10, a11, 28        \n"
         "s32i.n  a10, a2,  28        \n"
-        "l32i.n  a10, %[b1], 32      \n"
+        "l32i.n  a10, a11, 32        \n"
         "s32i.n  a10, a2,  32        \n"
-        "l32i.n  a10, %[b1], 36      \n"
+        "l32i.n  a10, a11, 36        \n"
         "s32i.n  a10, a2,  36        \n"
-        "l32i.n  a10, %[b1], 40      \n"
+        "l32i.n  a10, a11, 40        \n"
         "s32i.n  a10, a2,  40        \n"
-        "l32i.n  a10, %[b1], 44      \n"
+        "l32i.n  a10, a11, 44        \n"
         "s32i.n  a10, a2,  44        \n"
-        "l32i.n  a10, %[b1], 48      \n"
+        "l32i.n  a10, a11, 48        \n"
         "s32i.n  a10, a2,  48        \n"
-        "l32i.n  a10, %[b1], 52      \n"
+        "l32i.n  a10, a11, 52        \n"
         "s32i.n  a10, a2,  52        \n"
-        "l32i.n  a10, %[b1], 56      \n"
+        "l32i.n  a10, a11, 56        \n"
         "s32i.n  a10, a2,  56        \n"
-        "l32i.n  a10, %[b1], 60      \n"
+        "l32i.n  a10, a11, 60        \n"
         "s32i.n  a10, a2,  60        \n"
         "movi.n  a10, 1              \n"
-        "s32i.n  a10, a5,  0         \n"   /* START: midstate (hidden under next iter) */
+        "s32i.n  a10, a5,   0        \n"   /* START midstate */
 
     "v9_top: \n"
-        /* hash counter += 1 (64-bit) */
-        "l32i.n  a10, %[ih], 0       \n"
+        /* nonce (blk2 word 3) += 1 */
+        "l32i.n  a10, a3,  12        \n"
         "addi.n  a10, a10, 1         \n"
-        "s32i.n  a10, %[ih], 0       \n"
-        "bnez.n  a10, v9_nc          \n"
-        "l32i.n  a11, %[ih], 4       \n"
-        "addi.n  a11, a11, 1         \n"
-        "s32i.n  a11, %[ih], 4       \n"
-    "v9_nc: \n"
-        /* nonce (blk2 word 3, swapped repr) += 1 */
-        "l32i.n  a10, %[b2], 12      \n"
-        "addi.n  a10, a10, 1         \n"
-        "s32i.n  a10, %[b2], 12      \n"
+        "s32i.n  a10, a3,  12        \n"
 
-        /* copy blk2 (16 words) into TEXT while midstate runs */
-        "l32i.n  a10, %[b2], 0       \n"
-        "s32i.n  a10, a2,  0         \n"
-        "l32i.n  a10, %[b2], 4       \n"
-        "s32i.n  a10, a2,  4         \n"
-        "l32i.n  a10, %[b2], 8       \n"
-        "s32i.n  a10, a2,  8         \n"
-        "l32i.n  a10, %[b2], 12      \n"
+        /* copy blk2 image (16 words) into TEXT while midstate runs */
+        "l32i.n  a10, a3,   0        \n"
+        "s32i.n  a10, a2,   0        \n"
+        "l32i.n  a10, a3,   4        \n"
+        "s32i.n  a10, a2,   4        \n"
+        "l32i.n  a10, a3,   8        \n"
+        "s32i.n  a10, a2,   8        \n"
+        "l32i.n  a10, a3,  12        \n"
         "s32i.n  a10, a2,  12        \n"
-        "l32i.n  a10, %[b2], 16      \n"
+        "l32i.n  a10, a3,  16        \n"
         "s32i.n  a10, a2,  16        \n"
-        "l32i.n  a10, %[b2], 20      \n"
+        "l32i.n  a10, a3,  20        \n"
         "s32i.n  a10, a2,  20        \n"
-        "l32i.n  a10, %[b2], 24      \n"
+        "l32i.n  a10, a3,  24        \n"
         "s32i.n  a10, a2,  24        \n"
-        "l32i.n  a10, %[b2], 28      \n"
+        "l32i.n  a10, a3,  28        \n"
         "s32i.n  a10, a2,  28        \n"
-        "l32i.n  a10, %[b2], 32      \n"
+        "l32i.n  a10, a3,  32        \n"
         "s32i.n  a10, a2,  32        \n"
-        "l32i.n  a10, %[b2], 36      \n"
+        "l32i.n  a10, a3,  36        \n"
         "s32i.n  a10, a2,  36        \n"
-        "l32i.n  a10, %[b2], 40      \n"
+        "l32i.n  a10, a3,  40        \n"
         "s32i.n  a10, a2,  40        \n"
-        "l32i.n  a10, %[b2], 44      \n"
+        "l32i.n  a10, a3,  44        \n"
         "s32i.n  a10, a2,  44        \n"
-        "l32i.n  a10, %[b2], 48      \n"
+        "l32i.n  a10, a3,  48        \n"
         "s32i.n  a10, a2,  48        \n"
-        "l32i.n  a10, %[b2], 52      \n"
+        "l32i.n  a10, a3,  52        \n"
         "s32i.n  a10, a2,  52        \n"
-        "l32i.n  a10, %[b2], 56      \n"
+        "l32i.n  a10, a3,  56        \n"
         "s32i.n  a10, a2,  56        \n"
-        "l32i.n  a10, %[b2], 60      \n"
+        "l32i.n  a10, a3,  60        \n"
         "s32i.n  a10, a2,  60        \n"
 
         /* w1: midstate wait (mostly hidden) */
-        "l16ui   a10, %[nd], 0       \n"
+        "l16ui   a10, a4,  0         \n"
         "beqz.n  a10, v9_p1          \n"
     "v9_d1: \n"
         "addi    a10, a10, -1        \n"
@@ -794,10 +813,10 @@ bool IRAM_ATTR sha256_pipelined_mine_v9(
         "bnez.n  a10, v9_p1          \n"
 
         "movi.n  a10, 1              \n"
-        "s32i.n  a10, a5,  4         \n"   /* CONTINUE: blk2 (hash1 complete) */
+        "s32i.n  a10, a5,  4         \n"   /* CONTINUE blk2 */
 
         /* w2: blk2 hash */
-        "l16ui   a10, %[nd], 2       \n"
+        "l16ui   a10, a4,  2         \n"
         "beqz.n  a10, v9_p2          \n"
     "v9_d2: \n"
         "addi    a10, a10, -1        \n"
@@ -806,17 +825,17 @@ bool IRAM_ATTR sha256_pipelined_mine_v9(
         "l32i.n  a10, a5, 12         \n"
         "bnez.n  a10, v9_p2          \n"
 
-        /* build hash2 block tail (over blk2's consumed words) */
+        /* hash2 block tail over blk2's consumed words */
         "movi    a10, 0x80000000     \n"
-        "s32i.n  a10, a2,  32        \n"   /* pad at word 8  */
+        "s32i.n  a10, a2,  32        \n"
         "movi    a10, 0x100          \n"
-        "s32i.n  a10, a2,  60        \n"   /* 256-bit length at word 15 */
+        "s32i.n  a10, a2,  60        \n"
 
         "movi.n  a10, 1              \n"
         "s32i.n  a10, a5,  8         \n"   /* LOAD#1: D1 -> TEXT[0..7] */
 
-        /* w3: LOAD wait */
-        "l16ui   a10, %[nd], 4       \n"
+        /* w3 */
+        "l16ui   a10, a4,  4         \n"
         "beqz.n  a10, v9_p3          \n"
     "v9_d3: \n"
         "addi    a10, a10, -1        \n"
@@ -826,28 +845,28 @@ bool IRAM_ATTR sha256_pipelined_mine_v9(
         "bnez.n  a10, v9_p3          \n"
 
         "movi.n  a10, 1              \n"
-        "s32i.n  a10, a5,  0         \n"   /* START: hash2 on [D1|pad|len] */
+        "s32i.n  a10, a5,  0         \n"   /* START hash2 */
 
-        /* overlap: restore blk1 words 8-15 while hash2 runs */
-        "l32i.n  a10, %[b1], 32      \n"
+        /* restore blk1 words 8..15 while hash2 runs */
+        "l32i.n  a10, a11, 32        \n"
         "s32i.n  a10, a2,  32        \n"
-        "l32i.n  a10, %[b1], 36      \n"
+        "l32i.n  a10, a11, 36        \n"
         "s32i.n  a10, a2,  36        \n"
-        "l32i.n  a10, %[b1], 40      \n"
+        "l32i.n  a10, a11, 40        \n"
         "s32i.n  a10, a2,  40        \n"
-        "l32i.n  a10, %[b1], 44      \n"
+        "l32i.n  a10, a11, 44        \n"
         "s32i.n  a10, a2,  44        \n"
-        "l32i.n  a10, %[b1], 48      \n"
+        "l32i.n  a10, a11, 48        \n"
         "s32i.n  a10, a2,  48        \n"
-        "l32i.n  a10, %[b1], 52      \n"
+        "l32i.n  a10, a11, 52        \n"
         "s32i.n  a10, a2,  52        \n"
-        "l32i.n  a10, %[b1], 56      \n"
+        "l32i.n  a10, a11, 56        \n"
         "s32i.n  a10, a2,  56        \n"
-        "l32i.n  a10, %[b1], 60      \n"
+        "l32i.n  a10, a11, 60        \n"
         "s32i.n  a10, a2,  60        \n"
 
         /* w4: hash2 */
-        "l16ui   a10, %[nd], 6       \n"
+        "l16ui   a10, a4,  6         \n"
         "beqz.n  a10, v9_p4          \n"
     "v9_d4: \n"
         "addi    a10, a10, -1        \n"
@@ -859,8 +878,8 @@ bool IRAM_ATTR sha256_pipelined_mine_v9(
         "movi.n  a10, 1              \n"
         "s32i.n  a10, a5,  8         \n"   /* LOAD#2: D2 -> TEXT[0..7] */
 
-        /* w5: LOAD wait */
-        "l16ui   a10, %[nd], 8       \n"
+        /* w5 */
+        "l16ui   a10, a4,  8         \n"
         "beqz.n  a10, v9_p5          \n"
     "v9_d5: \n"
         "addi    a10, a10, -1        \n"
@@ -869,53 +888,46 @@ bool IRAM_ATTR sha256_pipelined_mine_v9(
         "l32i.n  a10, a5, 12         \n"
         "bnez.n  a10, v9_p5          \n"
 
-        "l8ui    a10, %[flag], 0     \n"
+        "addi.n  a9,  a9,  1         \n"   /* count this hashed nonce */
+
+        "l8ui    a10, a15, 0         \n"
         "beqz.n  a10, v9_end         \n"
 
         "l16ui   a10, a2,  28        \n"   /* early reject on D2 */
         "beqz.n  a10, v9_end         \n"   /* candidate! */
 
-        /* tail: restore blk1 words 0-7 (clobbered by LOAD#2) and
-         * START the midstate for the next nonce (hidden under w1) */
-        "l32i.n  a10, %[b1], 0       \n"
-        "s32i.n  a10, a2,  0         \n"
-        "l32i.n  a10, %[b1], 4       \n"
-        "s32i.n  a10, a2,  4         \n"
-        "l32i.n  a10, %[b1], 8       \n"
-        "s32i.n  a10, a2,  8         \n"
-        "l32i.n  a10, %[b1], 12      \n"
-        "s32i.n  a10, a2,  12        \n"
-        "l32i.n  a10, %[b1], 16      \n"
-        "s32i.n  a10, a2,  16        \n"
-        "l32i.n  a10, %[b1], 20      \n"
-        "s32i.n  a10, a2,  20        \n"
-        "l32i.n  a10, %[b1], 24      \n"
+        /* tail: restore w0..w5 from registers, w6..w7 from blk1 */
+        "s32i.n  a6,  a2,   0        \n"
+        "s32i.n  a7,  a2,   4        \n"
+        "s32i.n  a8,  a2,   8        \n"
+        "s32i.n  a12, a2,  12        \n"
+        "s32i.n  a13, a2,  16        \n"
+        "s32i.n  a14, a2,  20        \n"
+        "l32i.n  a10, a11, 24        \n"
         "s32i.n  a10, a2,  24        \n"
-        "l32i.n  a10, %[b1], 28      \n"
+        "l32i.n  a10, a11, 28        \n"
         "s32i.n  a10, a2,  28        \n"
         "movi.n  a10, 1              \n"
-        "s32i.n  a10, a5,  0         \n"   /* START: midstate */
+        "s32i.n  a10, a5,   0        \n"   /* START midstate for next nonce */
 
         "j       v9_top              \n"
 
     "v9_end: \n"
-        /* NOTE: the candidate nonce already lives in blk2[3] (DRAM); the C
-         * epilogue (*nonce_ptr = blk2[3]) propagates it. Do NOT store a10
-         * here - both exits arrive with a10==0 (flag byte or l16ui test),
-         * which would erase the real candidate nonce. */
+        /* export burst count via the blk2 scratch word; the candidate nonce
+         * already lives in blk2[3] and is propagated by the C epilogue.
+         * (Do NOT store a10 here - it is zero on both exit paths.) */
+        "s32i.n  a9,  a3,  64        \n"
 
+        : [cx] "+r" (ctx_sink)
         :
-        : [sb]  "r"(sha_base),
-          [b1]  "r"(blk1),
-          [b2]  "r"(blk2),
-          [ih]  "r"(hash_count_ptr),
-          [flag] "r"(mining_flag),
-          [nd]  "r"(&g_v5_delays[0])
-        : "a2", "a5", "a10", "a11", "memory"
+        : "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9",
+          "a11", "a12", "a13", "a14", "a15", "memory"
     );
 
-    /* Candidate nonce = the value just hashed (incremented before use,
-     * unlike v3 which pre-increments => caller must NOT subtract 1). */
+    /* Single 64-bit add for the whole burst (was 6 insns per nonce in asm). */
+    *hash_count_ptr += blk2[16];
+
+    /* Candidate nonce = the value just hashed (incremented before use). */
     *nonce_ptr = blk2[3];
     return *mining_flag;
 }
