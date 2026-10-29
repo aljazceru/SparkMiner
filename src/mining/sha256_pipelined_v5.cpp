@@ -641,6 +641,7 @@ bool IRAM_ATTR sha256_pipelined_mine_v6(
 /* ------------------------------------------------------------------ */
 /* v9: NMMiner-shaped pipeline (see RESEARCH.md section 3).             */
 /*                                                                     */
+/* Historical scheduling note (old shared counters were racy):        */
 /* DO NOT "optimize" the per-nonce 64-bit counter update or the tail    */
 /* restore into register-cached stores without re-running the A/B/A     */
 /* benchmark (bench/BENCH.md round 3): a 2026-08-18 rewrite doing      */
@@ -652,8 +653,11 @@ bool IRAM_ATTR sha256_pipelined_mine_v6(
 /* midstate (block-1) START issued at the tail of iteration N hides    */
 /* completely under iteration N+1's stores, block-1 restoration is     */
 /* split around the pipeline, and all waits are tunable-delay +        */
-/* bounded-poll (correctness never depends on timing).                 */
+/* busy-poll, with START input-consumption guards validated on CYD.    */
 /*                                                                     */
+/* 2026-09-05: exact host SHA256d coverage tests exposed early TEXT     */
+/* reuse in v9. MEMW alone was insufficient; guard START for 8 NOPs.   */
+/* See bench/round4 for original failures and repaired coverage tests. */
 /* Per nonce:  CONT(blk2) LOAD START(hash2) LOAD  [check]  blk1-words  */
 /*             START(midstate for next nonce)                           */
 /* TEXT timeline (words):                                              */
@@ -740,6 +744,11 @@ bool IRAM_ATTR sha256_pipelined_mine_v9(
         "s32i.n  a10, a2,  60        \n"
         "movi.n  a10, 1              \n"
         "s32i.n  a10, a5,  0         \n"   /* START: midstate (hidden under next iter) */
+        "memw                         \n"
+        /* Let START consume TEXT before any pipelined overwrite. */
+        ".rept 8                     \n"
+        "nop.n                       \n"
+        ".endr                       \n"
 
     "v9_top: \n"
         /* hash counter += 1 (64-bit) */
@@ -802,6 +811,7 @@ bool IRAM_ATTR sha256_pipelined_mine_v9(
 
         "movi.n  a10, 1              \n"
         "s32i.n  a10, a5,  4         \n"   /* CONTINUE: blk2 (hash1 complete) */
+        "memw                         \n"
 
         /* w2: blk2 hash */
         "l16ui   a10, %[nd], 2       \n"
@@ -821,6 +831,7 @@ bool IRAM_ATTR sha256_pipelined_mine_v9(
 
         "movi.n  a10, 1              \n"
         "s32i.n  a10, a5,  8         \n"   /* LOAD#1: D1 -> TEXT[0..7] */
+        "memw                         \n"
 
         /* w3: LOAD wait */
         "l16ui   a10, %[nd], 4       \n"
@@ -834,6 +845,11 @@ bool IRAM_ATTR sha256_pipelined_mine_v9(
 
         "movi.n  a10, 1              \n"
         "s32i.n  a10, a5,  0         \n"   /* START: hash2 on [D1|pad|len] */
+        "memw                         \n"
+        /* Let START consume TEXT before any pipelined overwrite. */
+        ".rept 8                     \n"
+        "nop.n                       \n"
+        ".endr                       \n"
 
         /* overlap: restore blk1 words 8-15 while hash2 runs */
         "l32i.n  a10, %[b1], 32      \n"
@@ -865,6 +881,7 @@ bool IRAM_ATTR sha256_pipelined_mine_v9(
 
         "movi.n  a10, 1              \n"
         "s32i.n  a10, a5,  8         \n"   /* LOAD#2: D2 -> TEXT[0..7] */
+        "memw                         \n"
 
         /* w5: LOAD wait */
         "l16ui   a10, %[nd], 8       \n"
@@ -902,6 +919,11 @@ bool IRAM_ATTR sha256_pipelined_mine_v9(
         "s32i.n  a10, a2,  28        \n"
         "movi.n  a10, 1              \n"
         "s32i.n  a10, a5,  0         \n"   /* START: midstate */
+        "memw                         \n"
+        /* Let START consume TEXT before any pipelined overwrite. */
+        ".rept 8                     \n"
+        "nop.n                       \n"
+        ".endr                       \n"
 
         "j       v9_top              \n"
 
