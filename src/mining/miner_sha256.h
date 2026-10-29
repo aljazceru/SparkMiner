@@ -49,6 +49,18 @@ void miner_sha256_midstate(sha256_hash_t *ctx, block_header_t *hb);
  */
 bool miner_sha256_header(sha256_hash_t *midpoint, sha256_hash_t *ctx, block_header_t *hb);
 
+/**
+ * IRAM-resident share verifier for classic ESP32 core1.
+ * Identical algorithm to miner_sha256_header(); linked into IRAM on ESP32
+ * so infrequent share checks avoid cold flash-cache fetches.
+ *
+ * @param midpoint Pre-computed midstate from miner_sha256_midstate()
+ * @param ctx Output final hash result
+ * @param hb Block header with current nonce
+ * @return true if hash passes 16-bit check (potential share), false otherwise
+ */
+bool miner_sha256_verify(sha256_hash_t *midpoint, sha256_hash_t *ctx, block_header_t *hb);
+
 #ifdef __cplusplus
 }
 #endif

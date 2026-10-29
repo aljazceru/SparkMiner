@@ -268,8 +268,7 @@ void miner_sha256_midstate(sha256_hash_t *ctx, block_header_t *hb) {
     ctx->hash[7] += h;
 }
 
-bool miner_sha256_header(sha256_hash_t *midpoint, sha256_hash_t *ctx, block_header_t *hb) {
-    sha256_hash_t tmp;
+static inline __attribute__((always_inline)) bool miner_sha256_header_impl(sha256_hash_t *midpoint, sha256_hash_t *ctx, block_header_t *hb) {
     WORD temp1, temp2;
     uint8_t *data = (uint8_t *)hb;
     int i, j;
@@ -375,27 +374,15 @@ bool miner_sha256_header(sha256_hash_t *midpoint, sha256_hash_t *ctx, block_head
     CM(2, 3, 4, 5, 6, 7, 0, 1, 62);
     CM(1, 2, 3, 4, 5, 6, 7, 0, 63);
 
-    // First hash complete - byte-swap for second hash input
-    tmp.hash[0] = BYTESWAP32(WA[0] + midpoint->hash[0]);
-    tmp.hash[1] = BYTESWAP32(WA[1] + midpoint->hash[1]);
-    tmp.hash[2] = BYTESWAP32(WA[2] + midpoint->hash[2]);
-    tmp.hash[3] = BYTESWAP32(WA[3] + midpoint->hash[3]);
-    tmp.hash[4] = BYTESWAP32(WA[4] + midpoint->hash[4]);
-    tmp.hash[5] = BYTESWAP32(WA[5] + midpoint->hash[5]);
-    tmp.hash[6] = BYTESWAP32(WA[6] + midpoint->hash[6]);
-    tmp.hash[7] = BYTESWAP32(WA[7] + midpoint->hash[7]);
-
-    // Copy first hash into working area for double hash
-    data = (uint8_t *)tmp.hash;
-
-    w[0] = GET_DATA(data, 0);
-    w[1] = GET_DATA(data, 4);
-    w[2] = GET_DATA(data, 8);
-    w[3] = GET_DATA(data, 12);
-    w[4] = GET_DATA(data, 16);
-    w[5] = GET_DATA(data, 20);
-    w[6] = GET_DATA(data, 24);
-    w[7] = GET_DATA(data, 28);
+    // First hash complete - feed the second-hash schedule directly
+    w[0] = WA[0] + midpoint->hash[0];
+    w[1] = WA[1] + midpoint->hash[1];
+    w[2] = WA[2] + midpoint->hash[2];
+    w[3] = WA[3] + midpoint->hash[3];
+    w[4] = WA[4] + midpoint->hash[4];
+    w[5] = WA[5] + midpoint->hash[5];
+    w[6] = WA[6] + midpoint->hash[6];
+    w[7] = WA[7] + midpoint->hash[7];
 
     w[8] = 0x80000000;
     w[9] = w[10] = w[11] = w[12] = w[13] = w[14] = 0;
@@ -419,7 +406,7 @@ bool miner_sha256_header(sha256_hash_t *midpoint, sha256_hash_t *ctx, block_head
     R1(31); R1(32); R1(33); R1(34); R1(35);
     R1(36); R1(37); R1(38); R1(39); R1(40); R1(41); R1(42); R1(43); R1(44); R1(45);
     R1(46); R1(47); R1(48); R1(49); R1(50); R1(51); R1(52); R1(53); R1(54); R1(55);
-    R1(56); R1(57); R1(58); R1(59); R1(60); R1(61); R1(62); R1(63);
+    R1(56); R1(57); R1(58); R1(59); R1(60);
 
     CM(0, 1, 2, 3, 4, 5, 6, 7, 0);
     CM(7, 0, 1, 2, 3, 4, 5, 6, 1);
@@ -489,13 +476,17 @@ bool miner_sha256_header(sha256_hash_t *midpoint, sha256_hash_t *ctx, block_head
     CM(6, 7, 0, 1, 2, 3, 4, 5, 58);
     CM(5, 6, 7, 0, 1, 2, 3, 4, 59);
     CM(4, 5, 6, 7, 0, 1, 2, 3, 60);
+
+    // Round 60 fixes WA[7]; rounds 61..63 only update other words.
+    // Reject before computing their schedule and compression work.
+    ctx->hash[7] = WA[7] + h7;
+    if (ctx->hash[7] & 0xffff) return false;
+
+    // Deferred schedule tail + final rounds for surviving candidates
+    R1(61); R1(62); R1(63);
     CM(3, 4, 5, 6, 7, 0, 1, 2, 61);
     CM(2, 3, 4, 5, 6, 7, 0, 1, 62);
     CM(1, 2, 3, 4, 5, 6, 7, 0, 63);
-
-    // Early 16-bit reject - no need to continue if we don't have a good hash
-    ctx->hash[7] = WA[7] + h7;
-    if (ctx->hash[7] & 0xffff) return false;
 
     // Complete the output hash with byte-swap
     ctx->hash[0] = BYTESWAP32(WA[0] + h0);
@@ -508,4 +499,24 @@ bool miner_sha256_header(sha256_hash_t *midpoint, sha256_hash_t *ctx, block_head
     ctx->hash[7] = BYTESWAP32(ctx->hash[7]);
 
     return true;
+}
+
+// The double-SHA256 body is shared between the hot core0 mining loop and the
+// intermittent core1 share verifier.  Keeping it as an always-inlined helper
+// means each wrapper gets its own copy: core0 calls execute from flash (no
+// IRAM/SHA pipeline contention), while the classic-ESP32 core1 verifier lives
+// in IRAM (cold flash-cache fetches avoided for infrequent share checks).
+// This flash hot path benchmarked faster with -Os on classic ESP32.
+#if defined(CONFIG_IDF_TARGET_ESP32)
+__attribute__((optimize("Os")))
+#endif
+bool miner_sha256_header(sha256_hash_t *midpoint, sha256_hash_t *ctx, block_header_t *hb) {
+    return miner_sha256_header_impl(midpoint, ctx, hb);
+}
+
+#if defined(CONFIG_IDF_TARGET_ESP32)
+IRAM_ATTR
+#endif
+bool miner_sha256_verify(sha256_hash_t *midpoint, sha256_hash_t *ctx, block_header_t *hb) {
+    return miner_sha256_header_impl(midpoint, ctx, hb);
 }

@@ -796,7 +796,7 @@ void miner_task_core1(void *param) {
                 // BitsyMiner CRITICAL pattern: Verify with SOFTWARE SHA on UNSWAPPED header
                 // This is what the pool computes, so hashes MUST match!
                 hbVerify.nonce = candidate_nonce_native;
-                if (miner_sha256_header(&midstate, &ctx, &hbVerify)) {
+                if (miner_sha256_verify(&midstate, &ctx, &hbVerify)) {
                     // SOFTWARE verified share - submit it
                     hashCheck(jobId, &ctx, hbVerify.timestamp, candidate_nonce_native);
                 }
