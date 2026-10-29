@@ -370,6 +370,12 @@ void setup() {
     // NMMiner's 1000 KH/s must come from SHA optimization, not overclocking
     Serial.printf("[INIT] Running at %u MHz\n", getCpuFrequencyMhz());
 
+#ifdef V9_BENCH
+    extern void v9_benchmark_task(void *);
+    xTaskCreatePinnedToCore(v9_benchmark_task, "V9Bench", 8192, NULL, 19, NULL, 1);
+    return;
+#endif
+
     // Initialize NVS configuration
     nvs_config_init();
 
